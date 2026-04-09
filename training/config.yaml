@@ -1,0 +1,46 @@
+model:
+  architecture: edm_unet
+  base_channels: 128
+  channel_mults: [1, 2, 3, 4]
+  num_res_blocks: 3
+  attention_resolutions: [32, 16]
+  num_heads: 8
+  cond_dim: 512
+  cross_attn_dim: 512
+  dropout: 0.2
+  in_channels: 4
+  self_condition: true
+  clip_model: openai/clip-vit-large-patch14
+  color_space: oklab
+  sigma_data: 0.5
+
+diffusion:
+  sigma_min: 0.002
+  sigma_max: 80.0
+  P_mean: -1.2
+  P_std: 1.2
+
+training:
+  image_sizes: [32, 64, 128]
+  resolution_weights: [0.15, 0.25, 0.60]
+  batch_size: 64
+  gradient_accumulation: 1
+  learning_rate: 1.0e-4
+  lr_schedule: cosine_with_warmup
+  warmup_steps: 2000
+  total_steps: 300000
+  ema_decay: 0.995
+  mixed_precision: fp16
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  cond_drop_text: 0.1
+  cond_drop_palette: 0.1
+  cond_drop_both: 0.05
+  save_every: 5000
+  sample_every: 1000
+  log_every: 100
+
+data:
+  data_dir: ./data/processed
+  num_workers: 4
+  pin_memory: true

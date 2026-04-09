@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+checkpoints/*.pt
+checkpoints/*.safetensors
+data/raw/
+data/processed/
+*.aseprite-extension
+.DS_Store

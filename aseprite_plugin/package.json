@@ -1,0 +1,17 @@
+{
+  "name": "pixel-gen",
+  "displayName": "Pixel Gen",
+  "description": "AI-powered true pixel art generation with palette conditioning",
+  "version": "0.1.0",
+  "author": {
+    "name": "chadeus"
+  },
+  "categories": ["Scripts"],
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./plugin.lua"
+      }
+    ]
+  }
+}
