@@ -1,7 +1,13 @@
 """Main training script for the pixel art diffusion model.
 
-Usage:
+Run directly in your terminal:
     python -m training.train --config training/config.yaml
+
+Ctrl+C saves a checkpoint and exits cleanly.
+Auto-resumes from the latest checkpoint on next run.
+
+CLIP embeddings must be precomputed:
+    python -m data.cache_embeddings --data-dir data/processed
 """
 
 import argparse
@@ -9,28 +15,72 @@ import copy
 import logging
 import math
 import os
+import signal
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 from torch.utils.data import DataLoader
 import yaml
-from tqdm import tqdm
 
 from model.unet import EDMUNet
 from model.conditioning import ConditioningAssembler
 from model.diffusion import EDMPrecond, EDMLoss, HeunSampler
-from server.inference.clip_encoder import CLIPEncoder
-from training.dataset import PixelArtDataset, collate_fn
+from training.dataset import PixelArtDataset, ResolutionGroupedSampler, collate_fn
 from server.utils.color import denormalize_oklab, oklab_to_srgb_torch
-
-import numpy as np
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+_interrupted = False
+
+
+def _sigint_handler(signum, frame):
+    global _interrupted
+    logger.warning("Ctrl+C received — will save checkpoint and exit after current step.")
+    _interrupted = True
+
+
+def _find_latest_checkpoint(checkpoint_dir: str) -> Path | None:
+    ckpt_dir = Path(checkpoint_dir)
+    if not ckpt_dir.exists():
+        return None
+    checkpoints = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: p.stat().st_mtime)
+    return checkpoints[-1] if checkpoints else None
+
+
+def _save_checkpoint(path: Path, step: int, model, ema_model, cond_assembler,
+                     optimizer, scheduler, scaler):
+    tmp = path.with_suffix(".pt.tmp")
+    torch.save({
+        "step": step,
+        "model": model.state_dict(),
+        "ema_model": ema_model.state_dict(),
+        "cond_assembler": cond_assembler.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+    }, tmp)
+    tmp.rename(path)
+    logger.info(f"Saved checkpoint: {path.name}")
+
+
+def _rotate_checkpoints(checkpoint_dir: str, keep: int):
+    if keep <= 0:
+        return
+    ckpt_dir = Path(checkpoint_dir)
+    existing = sorted(ckpt_dir.glob("step_*.pt"), key=lambda p: p.stat().st_mtime)
+    while len(existing) > keep:
+        old = existing.pop(0)
+        old.unlink()
+        logger.info(f"Rotated out: {old.name}")
+
 
 def main():
+    global _interrupted
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -67,6 +117,9 @@ def main():
         self_condition=model_cfg["self_condition"],
     ).to(device)
 
+    # Enable gradient checkpointing to reduce VRAM
+    model.gradient_checkpointing = True
+
     cond_assembler = ConditioningAssembler(
         cond_dim=model_cfg["cond_dim"],
         clip_dim=768,
@@ -81,12 +134,8 @@ def main():
         P_std=diff_cfg["P_std"],
     )
 
-    # Count parameters
     total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in cond_assembler.parameters())
     logger.info(f"Model parameters: {total_params / 1e6:.1f}M")
-
-    # CLIP encoder (frozen)
-    clip_encoder = CLIPEncoder(model_cfg["clip_model"], str(device))
 
     # EMA
     ema_model = copy.deepcopy(model)
@@ -102,7 +151,7 @@ def main():
         betas=(0.9, 0.999),
     )
 
-    # LR schedule: cosine with warmup
+    # LR schedule
     warmup_steps = train_cfg["warmup_steps"]
     total_steps = train_cfg["total_steps"]
 
@@ -114,191 +163,194 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Dataset
+    # Dataset (loads cached CLIP embeddings — no CLIP model needed on GPU)
     dataset = PixelArtDataset(
         data_dir=data_cfg["data_dir"],
         image_sizes=train_cfg["image_sizes"],
         resolution_weights=train_cfg["resolution_weights"],
         lospec_palettes_dir="aseprite_plugin/palettes",
     )
+    batch_sampler = ResolutionGroupedSampler(dataset, train_cfg["batch_size"])
     dataloader = DataLoader(
         dataset,
-        batch_size=train_cfg["batch_size"],
-        shuffle=True,
+        batch_sampler=batch_sampler,
         num_workers=data_cfg.get("num_workers", 4),
         pin_memory=data_cfg.get("pin_memory", True),
         collate_fn=collate_fn,
-        drop_last=True,
     )
+
+    # Mixed precision
+    scaler = torch.amp.GradScaler("cuda", enabled=(train_cfg["mixed_precision"] == "fp16"))
+
+    # Checkpointing config
+    ckpt_dir = "checkpoints"
+    save_every = train_cfg.get("save_every", 5000)
+    keep_checkpoints = train_cfg.get("keep_checkpoints", 5)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs("samples", exist_ok=True)
 
     # Resume
     start_step = 0
-    if args.resume and os.path.exists(args.resume):
-        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+    resume_path = args.resume
+    if not resume_path:
+        latest = _find_latest_checkpoint(ckpt_dir)
+        if latest:
+            resume_path = str(latest)
+            logger.info(f"Auto-resuming from: {resume_path}")
+
+    if resume_path and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         cond_assembler.load_state_dict(ckpt["cond_assembler"])
         ema_model.load_state_dict(ckpt["ema_model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt["step"]
         logger.info(f"Resumed from step {start_step}")
 
-    # Mixed precision
-    scaler = torch.amp.GradScaler("cuda", enabled=(train_cfg["mixed_precision"] == "fp16"))
+    # Signal handler for clean Ctrl+C
+    signal.signal(signal.SIGINT, _sigint_handler)
 
-    # Sampler for evaluation samples
-    sampler = HeunSampler()
+    # Log VRAM after setup
+    allocated = torch.cuda.memory_allocated() / 1e9
+    logger.info(f"VRAM after setup: {allocated:.2f} GB")
 
     # Training loop
-    logger.info(f"Starting training for {total_steps} steps")
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("samples", exist_ok=True)
-
+    logger.info(f"Starting training for {total_steps} steps ({dataset.total} images)")
     model.train()
     cond_assembler.train()
     data_iter = iter(dataloader)
     step = start_step
+    grad_accum = train_cfg.get("gradient_accumulation", 1)
 
-    pbar = tqdm(total=total_steps, initial=start_step, desc="Training")
+    train_start = time.monotonic()
 
     while step < total_steps:
-        # Get batch (restart dataloader if exhausted)
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+        if _interrupted:
+            break
 
-        images = batch["image"].to(device)        # (B, 4, H, W)
-        captions = batch["caption"]                # list[str]
-        palettes = batch["palette"].to(device)     # (B, N, 3)
+        batch = next(data_iter)
+
+        images = batch["image"].to(device)
+        text_pooled = batch["text_pooled"].to(device)
+        text_tokens = batch["text_tokens"].to(device)
+        palettes = batch["palette"].to(device)
         pal_masks = batch["palette_mask"].to(device)
-        resolutions = batch["resolution"]          # list[int]
+        resolutions = batch["resolution"]
 
-        # Encode text with CLIP (no grad)
-        with torch.no_grad():
-            text_pooled, text_tokens = clip_encoder.encode_batch(captions)
-
-        # Classifier-free guidance dropout
         B = images.shape[0]
-        drop_text = torch.rand(B) < train_cfg["cond_drop_text"]
-        drop_palette = torch.rand(B) < train_cfg["cond_drop_palette"]
-        drop_both = torch.rand(B) < train_cfg["cond_drop_both"]
-        drop_text = drop_text | drop_both
-        drop_palette = drop_palette | drop_both
+        res = resolutions[0]
 
-        # For simplicity in batched training, we use the majority resolution
-        # (all items in a batch use the same resolution for simplicity)
-        # The dataset already samples by resolution weights
-        res = resolutions[0]  # all same in batch due to collate
-
-        # Self-conditioning: 50% of time, run model once and feed back prediction
+        # Self-conditioning (50% of the time)
         x_self_cond = None
         if model_cfg["self_condition"] and torch.rand(1).item() < 0.5:
             with torch.no_grad(), torch.amp.autocast("cuda", enabled=True):
-                # Quick estimate for self-conditioning
                 log_sigma = torch.randn(B, device=device) * diff_cfg["P_std"] + diff_cfg["P_mean"]
                 sigma_sc = log_sigma.exp()
                 noise_sc = torch.randn_like(images)
                 x_noisy_sc = images + sigma_sc.reshape(-1, 1, 1, 1) * noise_sc
-
                 cond_sc, cross_sc = cond_assembler(
                     sigma=sigma_sc, text_pooled=text_pooled, text_tokens=text_tokens,
                     palette=palettes, palette_mask=pal_masks, resolution=res,
                 )
                 x_self_cond = precond(x_noisy_sc, sigma_sc, cond_sc, cross_sc, None).detach()
 
-        # Assemble conditioning (with dropout applied per-sample)
-        # For batch efficiency, apply dropout as masking on the assembled vectors
+        # Assemble conditioning
         cond_vec, cross_tok = cond_assembler(
-            sigma=torch.ones(B, device=device),  # placeholder, EDMLoss samples its own
-            text_pooled=text_pooled,
-            text_tokens=text_tokens,
-            palette=palettes,
-            palette_mask=pal_masks,
-            resolution=res,
-            drop_text=False,  # handled at sample level below
-            drop_palette=False,
+            sigma=torch.ones(B, device=device),
+            text_pooled=text_pooled, text_tokens=text_tokens,
+            palette=palettes, palette_mask=pal_masks, resolution=res,
         )
 
-        # Forward pass with mixed precision
+        # Forward + backward
         with torch.amp.autocast("cuda", enabled=(train_cfg["mixed_precision"] == "fp16")):
             loss = loss_fn(precond, images, cond_vec, cross_tok, x_self_cond)
+            if grad_accum > 1:
+                loss = loss / grad_accum
 
-        # Backward
         scaler.scale(loss).backward()
 
-        if train_cfg["grad_clip_norm"] > 0:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(params, train_cfg["grad_clip_norm"])
+        # Gradient accumulation — only step optimizer every N steps
+        if (step + 1) % grad_accum == 0:
+            if train_cfg["grad_clip_norm"] > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(params, train_cfg["grad_clip_norm"])
 
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad()
-        scheduler.step()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            scheduler.step()
 
-        # EMA update
-        with torch.no_grad():
-            for p_ema, p_model in zip(ema_model.parameters(), model.parameters()):
-                p_ema.lerp_(p_model, 1 - ema_decay)
+            # EMA update
+            with torch.no_grad():
+                for p_ema, p_model in zip(ema_model.parameters(), model.parameters()):
+                    p_ema.lerp_(p_model, 1 - ema_decay)
 
         step += 1
-        pbar.update(1)
-        pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
         # Logging
-        if step % train_cfg["log_every"] == 0:
-            logger.info(f"Step {step}/{total_steps} | Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+        if step % train_cfg["log_every"] == 0 or step == start_step + 1:
+            vram = torch.cuda.memory_allocated() / 1e9
+            elapsed = time.monotonic() - train_start
+            steps_done = step - start_step
+            if steps_done > 0:
+                secs_per_step = elapsed / steps_done
+                eta_secs = secs_per_step * (total_steps - step)
+                eta_h, eta_rem = divmod(int(eta_secs), 3600)
+                eta_m = eta_rem // 60
+                eta_str = f"{eta_h}h{eta_m:02d}m"
+            else:
+                eta_str = "..."
+            logger.info(f"Step {step}/{total_steps} | Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | VRAM: {vram:.1f}GB | ETA: {eta_str}")
 
         # Save checkpoint
-        if step % train_cfg["save_every"] == 0:
-            ckpt_path = f"checkpoints/step_{step:07d}.pt"
-            torch.save({
-                "step": step,
-                "model": model.state_dict(),
-                "ema_model": ema_model.state_dict(),
-                "cond_assembler": cond_assembler.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-            }, ckpt_path)
-            logger.info(f"Saved checkpoint: {ckpt_path}")
+        if step % save_every == 0:
+            _save_checkpoint(
+                Path(ckpt_dir) / f"step_{step:07d}.pt", step,
+                model, ema_model, cond_assembler, optimizer, scheduler, scaler,
+            )
+            _rotate_checkpoints(ckpt_dir, keep_checkpoints)
 
         # Generate samples
         if step % train_cfg["sample_every"] == 0:
-            _generate_samples(ema_model, cond_assembler, precond, sampler,
-                              clip_encoder, step, device, model_cfg)
+            _generate_samples(ema_model, cond_assembler,
+                              step, device, model_cfg)
 
-    pbar.close()
-    logger.info("Training complete.")
+    # Save final checkpoint on exit
+    _save_checkpoint(
+        Path(ckpt_dir) / f"step_{step:07d}.pt", step,
+        model, ema_model, cond_assembler, optimizer, scheduler, scaler,
+    )
+    _rotate_checkpoints(ckpt_dir, keep_checkpoints)
+    logger.info(f"Training {'interrupted' if _interrupted else 'complete'} at step {step}.")
 
 
 @torch.no_grad()
-def _generate_samples(ema_model, cond_assembler, precond_template, sampler,
-                      clip_encoder, step, device, model_cfg):
-    """Generate a grid of sample images for visual inspection."""
+def _generate_samples(ema_model, cond_assembler, step, device, model_cfg):
+    """Generate a 2x2 grid of sample images.
+
+    Uses hardcoded conditioning vectors (no CLIP needed).
+    """
     ema_model.eval()
     cond_assembler.eval()
 
     precond = EDMPrecond(ema_model, sigma_data=model_cfg["sigma_data"])
-
-    prompts = [
-        "pixel art knight character, side view",
-        "pixel art tree, green leaves",
-        "pixel art robot, front view",
-        "pixel art treasure chest, open",
-    ]
+    sampler = HeunSampler()
 
     size = 64
     images = []
 
-    for prompt in prompts:
-        text_pooled, text_tokens = clip_encoder.encode(prompt)
+    # Generate 4 samples with null conditioning (unconditional)
+    for _ in range(4):
+        null_pooled = torch.zeros(1, 768, device=device)
+        null_tokens = torch.zeros(1, 77, 768, device=device)
         palette_t = torch.zeros(1, 1, 3, device=device)
         pal_mask = torch.ones(1, 1, dtype=torch.bool, device=device)
 
         cond, cross = cond_assembler(
             sigma=torch.ones(1, device=device),
-            text_pooled=text_pooled, text_tokens=text_tokens,
+            text_pooled=null_pooled, text_tokens=null_tokens,
             palette=palette_t, palette_mask=pal_mask,
             resolution=size,
         )
@@ -308,7 +360,6 @@ def _generate_samples(ema_model, cond_assembler, precond_template, sampler,
             num_steps=20, device=device, self_condition=model_cfg["self_condition"],
         )
 
-        # Convert to RGB image
         x = x.squeeze(0).permute(1, 2, 0).cpu()
         oklab = denormalize_oklab(x[:, :, :3])
         rgb = oklab_to_srgb_torch(oklab)
@@ -317,13 +368,13 @@ def _generate_samples(ema_model, cond_assembler, precond_template, sampler,
         img = (rgba * 255).clamp(0, 255).byte().numpy()
         images.append(img)
 
-    # Arrange in 2x2 grid
     grid = np.zeros((size * 2, size * 2, 4), dtype=np.uint8)
     for i, img in enumerate(images):
         r, c = divmod(i, 2)
         grid[r * size:(r + 1) * size, c * size:(c + 1) * size] = img
 
     Image.fromarray(grid, "RGBA").save(f"samples/step_{step:07d}.png")
+    logger.info(f"Saved sample grid: samples/step_{step:07d}.png")
 
     ema_model.train()
     cond_assembler.train()

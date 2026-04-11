@@ -15,6 +15,7 @@ from tqdm import tqdm
 from sklearn.cluster import KMeans
 
 from data.filter import is_valid_pixel_art
+from data.attributes import detect_all_attributes
 from server.postprocess.grid_snap import detect_grid_size, downsample_to_grid
 from server.utils.color import srgb_to_oklab, oklab_to_srgb
 
@@ -110,6 +111,9 @@ def process_image(img_path: Path, output_base: Path) -> bool:
     # Extract palette
     palette = extract_palette(img)
 
+    # Detect attributes
+    attributes = detect_all_attributes(img, palette, source_path=str(img_path.name))
+
     # Save
     out_dir = output_base / str(target)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -121,10 +125,12 @@ def process_image(img_path: Path, output_base: Path) -> bool:
     Image.fromarray(img, "RGBA").save(out_img)
 
     meta = {
-        "caption": "pixel art sprite",  # placeholder, captioning is separate
+        "caption": "",  # filled by caption.py
         "palette": palette,
         "original_size": [int(W), int(H)],
         "grid_detected": int(grid),
+        "source_name": img_path.name,
+        "attributes": attributes,
     }
     with open(out_meta, "w") as f:
         json.dump(meta, f)

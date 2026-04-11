@@ -1,6 +1,6 @@
 """EDM-style UNet for pixel art generation.
 
-~80M parameters. Hierarchical encoder-decoder with skip connections,
+~134M parameters. Hierarchical encoder-decoder with skip connections,
 self-attention at lower resolutions, cross-attention to text tokens,
 and FiLM conditioning from the conditioning assembler.
 """
@@ -8,6 +8,7 @@ and FiLM conditioning from the conditioning assembler.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from model.blocks import ResBlock, SelfAttention, CrossAttention, Downsample, Upsample
 
@@ -104,6 +105,7 @@ class EDMUNet(nn.Module):
         # Store for resolution -> attention mapping
         self._attention_resolutions = set(attention_resolutions)
         self._channel_mults = channel_mults
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -130,12 +132,20 @@ class EDMUNet(nn.Module):
         h = self.input_conv(x)
         skips = [h]
 
-        # Encoder
+        def _run_block(block, h, cond, cross_tokens):
+            if self.gradient_checkpointing and self.training:
+                return checkpoint(
+                    _forward_block, block, h, cond, cross_tokens,
+                    use_reentrant=False,
+                )
+            return _forward_block(block, h, cond, cross_tokens)
+
+        # Encoder (checkpointed)
         block_idx = 0
         for level in range(len(self._channel_mults)):
             for _ in range(3):  # num_res_blocks
                 block = self.encoder_blocks[block_idx]
-                h = _forward_block(block, h, cond, cross_tokens)
+                h = _run_block(block, h, cond, cross_tokens)
                 skips.append(h)
                 block_idx += 1
 
@@ -144,10 +154,10 @@ class EDMUNet(nn.Module):
                 h = ds(h)
                 skips.append(h)
 
-        # Bottleneck
-        h = _forward_block(self.bottleneck, h, cond, cross_tokens)
+        # Bottleneck (checkpointed)
+        h = _run_block(self.bottleneck, h, cond, cross_tokens)
 
-        # Decoder
+        # Decoder (not checkpointed — needs skip connections)
         block_idx = 0
         for level in reversed(range(len(self._channel_mults))):
             for _ in range(4):  # num_res_blocks + 1

@@ -10,7 +10,6 @@ model:
   dropout: 0.2
   in_channels: 4
   self_condition: true
-  clip_model: openai/clip-vit-large-patch14
   color_space: oklab
   sigma_data: 0.5
 
@@ -23,10 +22,9 @@ diffusion:
 training:
   image_sizes: [32, 64, 128]
   resolution_weights: [0.15, 0.25, 0.60]
-  batch_size: 64
-  gradient_accumulation: 1
+  batch_size: 4
+  gradient_accumulation: 16
   learning_rate: 1.0e-4
-  lr_schedule: cosine_with_warmup
   warmup_steps: 2000
   total_steps: 300000
   ema_decay: 0.995
@@ -36,9 +34,10 @@ training:
   cond_drop_text: 0.1
   cond_drop_palette: 0.1
   cond_drop_both: 0.05
-  save_every: 5000
   sample_every: 1000
   log_every: 100
+  save_every: 5000
+  keep_checkpoints: 5
 
 data:
   data_dir: ./data/processed

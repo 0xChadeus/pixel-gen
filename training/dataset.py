@@ -1,4 +1,8 @@
-"""Multi-resolution pixel art dataset for training."""
+"""Multi-resolution pixel art dataset for training.
+
+Loads images, cached CLIP embeddings, and palettes. CLIP embeddings
+must be precomputed via `python -m data.cache_embeddings`.
+"""
 
 import os
 import json
@@ -10,7 +14,7 @@ import torch
 from torch.utils.data import Dataset
 from PIL import Image
 
-from server.utils.color import srgb_to_oklab_torch, normalize_oklab
+from server.utils.color import srgb_to_oklab_torch, normalize_oklab, srgb_to_oklab
 from training.augment import augment
 
 
@@ -21,11 +25,8 @@ class PixelArtDataset(Dataset):
         data_dir/
             32/
                 sprite_0001.png
-                sprite_0001.json  # {"caption": "...", "palette": [[r,g,b], ...]}
-                ...
-            64/
-                ...
-            128/
+                sprite_0001.json     # {"caption": "...", "palette": [...]}
+                sprite_0001.emb.pt   # {"pooled": (768,), "tokens": (77, 768)}
                 ...
     """
 
@@ -44,21 +45,26 @@ class PixelArtDataset(Dataset):
         self.image_sizes = image_sizes
         self.resolution_weights = resolution_weights
 
-        # Load all items per resolution
         self.items_by_res: dict[int, list[dict]] = {}
         for size in image_sizes:
             res_dir = Path(data_dir) / str(size)
             items = []
             if res_dir.exists():
                 for png in sorted(res_dir.glob("*.png")):
+                    emb_path = png.with_suffix(".emb.pt")
                     meta_path = png.with_suffix(".json")
+
+                    if not emb_path.exists():
+                        continue  # skip images without cached embeddings
+
                     meta = {}
                     if meta_path.exists():
                         with open(meta_path) as f:
                             meta = json.load(f)
+
                     items.append({
                         "image_path": str(png),
-                        "caption": meta.get("caption", "pixel art sprite"),
+                        "emb_path": str(emb_path),
                         "palette": np.array(meta.get("palette", []), dtype=np.uint8) if meta.get("palette") else None,
                     })
             self.items_by_res[size] = items
@@ -77,29 +83,27 @@ class PixelArtDataset(Dataset):
         return self.total
 
     def __getitem__(self, idx):
-        # Sample a resolution according to weights
-        size = random.choices(self.image_sizes, weights=self.resolution_weights, k=1)[0]
-        items = self.items_by_res.get(size, [])
+        # Map flat index to (resolution, item)
+        offset = 0
+        item = None
+        size = self.image_sizes[0]
+        for s in self.image_sizes:
+            items = self.items_by_res.get(s, [])
+            if idx < offset + len(items):
+                item = items[idx - offset]
+                size = s
+                break
+            offset += len(items)
 
-        if not items:
-            # Fallback to any available resolution
-            for s in self.image_sizes:
-                if self.items_by_res[s]:
-                    items = self.items_by_res[s]
-                    size = s
-                    break
-
-        if not items:
-            # Return zeros if no data (shouldn't happen in practice)
+        if item is None:
             return {
                 "image": torch.zeros(4, 32, 32),
-                "caption": "pixel art sprite",
+                "text_pooled": torch.zeros(768),
+                "text_tokens": torch.zeros(77, 768),
                 "palette": torch.zeros(1, 3),
                 "palette_mask": torch.zeros(1, dtype=torch.bool),
                 "resolution": 32,
             }
-
-        item = random.choice(items)
 
         # Load image
         img = Image.open(item["image_path"]).convert("RGBA")
@@ -118,16 +122,16 @@ class PixelArtDataset(Dataset):
 
         oklab = srgb_to_oklab_torch(rgb)
         normalized = normalize_oklab(oklab)
-
-        # Alpha: [0,1] -> [-1,1]
         alpha_norm = alpha * 2.0 - 1.0
-
-        # Stack: (H, W, 4) -> (4, H, W)
         image_tensor = torch.cat([normalized, alpha_norm], dim=-1).permute(2, 0, 1)
+
+        # Load cached CLIP embeddings
+        emb = torch.load(item["emb_path"], weights_only=True)
+        text_pooled = emb["pooled"]
+        text_tokens = emb["tokens"]
 
         # Prepare palette tensor
         if palette is not None and len(palette) > 0:
-            from server.utils.color import srgb_to_oklab
             pal_lab = srgb_to_oklab(palette).astype(np.float32)
             pal_tensor = torch.from_numpy(pal_lab)
             pal_mask = torch.ones(len(palette), dtype=torch.bool)
@@ -137,7 +141,8 @@ class PixelArtDataset(Dataset):
 
         return {
             "image": image_tensor,
-            "caption": item["caption"],
+            "text_pooled": text_pooled,
+            "text_tokens": text_tokens,
             "palette": pal_tensor,
             "palette_mask": pal_mask,
             "resolution": size,
@@ -168,13 +173,43 @@ def _parse_gpl(path: Path) -> np.ndarray | None:
     return None
 
 
+class ResolutionGroupedSampler(torch.utils.data.Sampler):
+    """Yields batches where all items share the same resolution."""
+
+    def __init__(self, dataset: PixelArtDataset, batch_size: int):
+        self.dataset = dataset
+        self.batch_size = batch_size
+
+        self.indices_by_res: dict[int, list[int]] = {}
+        offset = 0
+        for size in dataset.image_sizes:
+            n = len(dataset.items_by_res.get(size, []))
+            self.indices_by_res[size] = list(range(offset, offset + n))
+            offset += n
+
+        self.available_sizes = [s for s in dataset.image_sizes
+                                if len(self.indices_by_res.get(s, [])) > 0]
+        self.weights = [dataset.resolution_weights[dataset.image_sizes.index(s)]
+                        for s in self.available_sizes]
+
+    def __iter__(self):
+        while True:
+            size = random.choices(self.available_sizes, weights=self.weights, k=1)[0]
+            indices = self.indices_by_res[size]
+            batch = [random.choice(indices) for _ in range(self.batch_size)]
+            yield batch
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
+
 def collate_fn(batch: list[dict]) -> dict:
     """Custom collate that handles variable-length palettes."""
     images = torch.stack([b["image"] for b in batch])
-    captions = [b["caption"] for b in batch]
+    text_pooled = torch.stack([b["text_pooled"] for b in batch])
+    text_tokens = torch.stack([b["text_tokens"] for b in batch])
     resolutions = [b["resolution"] for b in batch]
 
-    # Pad palettes to same length
     max_colors = max(b["palette"].shape[0] for b in batch)
     palettes = []
     masks = []
@@ -190,7 +225,8 @@ def collate_fn(batch: list[dict]) -> dict:
 
     return {
         "image": images,
-        "caption": captions,
+        "text_pooled": text_pooled,
+        "text_tokens": text_tokens,
         "palette": torch.stack(palettes),
         "palette_mask": torch.stack(masks),
         "resolution": resolutions,

@@ -10,11 +10,6 @@ from tqdm import tqdm
 
 
 DATASETS = {
-    "free_pixelart": {
-        "hf_id": "bghira/free-to-use-pixelart",
-        "image_col": "image",
-        "license": "MIT",
-    },
     "limbicnation": {
         "hf_id": "Limbicnation/pixel-art-character",
         "image_col": "image",
