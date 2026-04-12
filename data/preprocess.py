@@ -14,7 +14,7 @@ from PIL import Image
 from tqdm import tqdm
 from sklearn.cluster import KMeans
 
-from data.filter import is_valid_pixel_art
+from data.filter import is_valid_pixel_art, detect_effective_resolution
 from data.attributes import detect_all_attributes
 from server.postprocess.grid_snap import detect_grid_size, downsample_to_grid
 from server.utils.color import srgb_to_oklab, oklab_to_srgb
@@ -76,8 +76,14 @@ def process_image(img_path: Path, output_base: Path) -> bool:
     if not valid:
         return False
 
-    # Classify into target resolution bucket
-    target = classify_size(W, H)
+    # Check effective resolution (catches upscaled sprites that
+    # autocorrelation-based grid detection misses)
+    effective = detect_effective_resolution(img)
+    if effective < max(W, H):
+        # Image appears upscaled — classify by effective resolution
+        target = classify_size(effective, effective)
+    else:
+        target = classify_size(W, H)
 
     # Resize to target (nearest neighbor, pad to square)
     size = max(W, H)

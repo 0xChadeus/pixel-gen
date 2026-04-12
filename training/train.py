@@ -132,6 +132,7 @@ def main():
         sigma_data=model_cfg["sigma_data"],
         P_mean=diff_cfg["P_mean"],
         P_std=diff_cfg["P_std"],
+        lpips_weight=train_cfg.get("lpips_weight", 0.0),
     )
 
     total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in cond_assembler.parameters())
@@ -216,8 +217,14 @@ def main():
     allocated = torch.cuda.memory_allocated() / 1e9
     logger.info(f"VRAM after setup: {allocated:.2f} GB")
 
+    # Epoch tracking
+    batch_size = train_cfg["batch_size"]
+    steps_per_epoch = max(dataset.total // batch_size, 1)
+    epoch_ckpt_dir = os.path.join(ckpt_dir, "epochs")
+    os.makedirs(epoch_ckpt_dir, exist_ok=True)
+
     # Training loop
-    logger.info(f"Starting training for {total_steps} steps ({dataset.total} images)")
+    logger.info(f"Starting training for {total_steps} steps ({dataset.total} images, ~{steps_per_epoch} steps/epoch)")
     model.train()
     cond_assembler.train()
     data_iter = iter(dataloader)
@@ -256,16 +263,34 @@ def main():
                 )
                 x_self_cond = precond(x_noisy_sc, sigma_sc, cond_sc, cross_sc, None).detach()
 
+        # Conditioning dropout for classifier-free guidance
+        drop_text = False
+        drop_palette = False
+        r = torch.rand(1).item()
+        drop_both = train_cfg.get("cond_drop_both", 0.05)
+        drop_t = train_cfg.get("cond_drop_text", 0.1)
+        drop_p = train_cfg.get("cond_drop_palette", 0.1)
+        if r < drop_both:
+            drop_text = True
+            drop_palette = True
+        elif r < drop_both + drop_t:
+            drop_text = True
+        elif r < drop_both + drop_t + drop_p:
+            drop_palette = True
+
         # Assemble conditioning
         cond_vec, cross_tok = cond_assembler(
             sigma=torch.ones(B, device=device),
             text_pooled=text_pooled, text_tokens=text_tokens,
             palette=palettes, palette_mask=pal_masks, resolution=res,
+            drop_text=drop_text, drop_palette=drop_palette,
         )
 
         # Forward + backward
         with torch.amp.autocast("cuda", enabled=(train_cfg["mixed_precision"] == "fp16")):
-            loss = loss_fn(precond, images, cond_vec, cross_tok, x_self_cond)
+            loss = loss_fn(precond, images, cond_vec, cross_tok, x_self_cond,
+                           resolution=res)
+            raw_loss = loss.item()
             if grad_accum > 1:
                 loss = loss / grad_accum
 
@@ -302,9 +327,10 @@ def main():
                 eta_str = f"{eta_h}h{eta_m:02d}m"
             else:
                 eta_str = "..."
-            logger.info(f"Step {step}/{total_steps} | Loss: {loss.item():.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | VRAM: {vram:.1f}GB | ETA: {eta_str}")
+            epoch = step // steps_per_epoch
+            logger.info(f"Step {step}/{total_steps} (epoch {epoch}) | Loss: {raw_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | VRAM: {vram:.1f}GB | ETA: {eta_str}")
 
-        # Save checkpoint
+        # Save intra-epoch checkpoint (rotated — keeps last N)
         if step % save_every == 0:
             _save_checkpoint(
                 Path(ckpt_dir) / f"step_{step:07d}.pt", step,
@@ -312,10 +338,22 @@ def main():
             )
             _rotate_checkpoints(ckpt_dir, keep_checkpoints)
 
+        # Save epoch checkpoint (permanent — never rotated)
+        if step % steps_per_epoch == 0 and step > start_step:
+            epoch = step // steps_per_epoch
+            epoch_path = Path(epoch_ckpt_dir) / f"epoch_{epoch:04d}.pt"
+            if not epoch_path.exists():
+                _save_checkpoint(
+                    epoch_path, step,
+                    model, ema_model, cond_assembler, optimizer, scheduler, scaler,
+                )
+                logger.info(f"Epoch {epoch} complete ({step} steps)")
+
         # Generate samples
         if step % train_cfg["sample_every"] == 0:
             _generate_samples(ema_model, cond_assembler,
-                              step, device, model_cfg)
+                              step, device, model_cfg,
+                              available_sizes=batch_sampler.available_sizes)
 
     # Save final checkpoint on exit
     _save_checkpoint(
@@ -326,55 +364,258 @@ def main():
     logger.info(f"Training {'interrupted' if _interrupted else 'complete'} at step {step}.")
 
 
-@torch.no_grad()
-def _generate_samples(ema_model, cond_assembler, step, device, model_cfg):
-    """Generate a 2x2 grid of sample images.
+_EVAL_PROMPTS = [
+    "pixel art warrior with sword, front view",
+    "pixel art green tree",
+    "pixel art treasure chest",
+    "pixel art slime monster",
+]
 
-    Uses hardcoded conditioning vectors (no CLIP needed).
+# PICO-8 palette (16 colors) in OKLab — hardcoded to avoid runtime dependencies
+_PICO8_RGB = [
+    [0, 0, 0], [29, 43, 83], [126, 37, 83], [0, 135, 81],
+    [171, 82, 54], [95, 87, 79], [194, 195, 199], [255, 241, 232],
+    [255, 0, 77], [255, 163, 0], [255, 236, 39], [0, 228, 54],
+    [41, 173, 255], [131, 118, 156], [255, 119, 168], [255, 204, 170],
+]
+
+
+def _ensure_eval_embeddings(device: torch.device) -> dict:
+    """Load or compute CLIP embeddings for fixed evaluation prompts.
+
+    Computes once and caches to samples/eval_embeddings.pt so CLIP
+    is never loaded during training after the first run.
+    """
+    cache_path = Path("samples/eval_embeddings.pt")
+    if cache_path.exists():
+        return torch.load(cache_path, map_location=device, weights_only=True)
+
+    logger.info("Computing CLIP embeddings for evaluation prompts (one-time)...")
+    from server.inference.clip_encoder import CLIPEncoder
+    clip = CLIPEncoder(device=str(device))
+
+    embeddings = {}
+    for i, prompt in enumerate(_EVAL_PROMPTS):
+        pooled, tokens = clip.encode(prompt)
+        embeddings[f"pooled_{i}"] = pooled.cpu()
+        embeddings[f"tokens_{i}"] = tokens.cpu()
+
+    torch.save(embeddings, cache_path)
+    # Free CLIP from GPU
+    del clip
+    torch.cuda.empty_cache()
+    logger.info(f"Cached evaluation embeddings to {cache_path}")
+    return {k: v.to(device) for k, v in embeddings.items()}
+
+
+def _sample_one(precond, cond, cross, size, device, model_cfg, seed):
+    """Generate a single sample image and return (H, W, 4) uint8 RGBA."""
+    # Set global seed so HeunSampler's internal torch.randn is deterministic
+    torch.cuda.manual_seed(seed)
+    torch.manual_seed(seed)
+
+    sampler = HeunSampler()
+    x = sampler.sample(
+        precond, (1, 4, size, size), cond, cross,
+        num_steps=20, device=device, self_condition=model_cfg["self_condition"],
+    )
+
+    x = x.squeeze(0).permute(1, 2, 0).cpu()
+    oklab = denormalize_oklab(x[:, :, :3])
+    rgb = oklab_to_srgb_torch(oklab)
+    alpha = (x[:, :, 3:4] + 1.0) / 2.0
+    rgba = torch.cat([rgb, alpha.clamp(0, 1)], dim=-1)
+    return (rgba * 255).clamp(0, 255).byte().numpy()
+
+
+@torch.no_grad()
+def _generate_samples(ema_model, cond_assembler, step, device, model_cfg,
+                      available_sizes=None):
+    """Generate evaluation grids at each available resolution.
+
+    For each resolution, produces a grid with:
+      Row 1: 4 unconditional samples
+      Row 2: 4 text-conditioned samples (with CFG)
+      Row 3: 4 palette-conditioned samples (PICO-8, with CFG)
     """
     ema_model.eval()
     cond_assembler.eval()
 
     precond = EDMPrecond(ema_model, sigma_data=model_cfg["sigma_data"])
-    sampler = HeunSampler()
 
-    size = 64
-    images = []
+    if available_sizes is None:
+        available_sizes = [64]
 
-    # Generate 4 samples with null conditioning (unconditional)
-    for _ in range(4):
-        null_pooled = torch.zeros(1, 768, device=device)
-        null_tokens = torch.zeros(1, 77, 768, device=device)
-        palette_t = torch.zeros(1, 1, 3, device=device)
-        pal_mask = torch.ones(1, 1, dtype=torch.bool, device=device)
+    # Load cached evaluation embeddings
+    eval_embs = _ensure_eval_embeddings(device)
 
-        cond, cross = cond_assembler(
-            sigma=torch.ones(1, device=device),
-            text_pooled=null_pooled, text_tokens=null_tokens,
-            palette=palette_t, palette_mask=pal_mask,
-            resolution=size,
-        )
+    # Prepare PICO-8 palette tensor
+    pico8 = torch.tensor(_PICO8_RGB, dtype=torch.float32, device=device) / 255.0
+    from server.utils.color import srgb_to_oklab_torch
+    pico8_lab = srgb_to_oklab_torch(pico8).unsqueeze(0)  # (1, 16, 3)
+    pico8_mask = torch.ones(1, 16, dtype=torch.bool, device=device)
 
-        x = sampler.sample(
-            precond, (1, 4, size, size), cond, cross,
-            num_steps=20, device=device, self_condition=model_cfg["self_condition"],
-        )
+    guidance_scale = 5.0
+    n_cols = 4
+    base_seed = step  # deterministic per step
 
-        x = x.squeeze(0).permute(1, 2, 0).cpu()
-        oklab = denormalize_oklab(x[:, :, :3])
-        rgb = oklab_to_srgb_torch(oklab)
-        alpha = (x[:, :, 3:4] + 1.0) / 2.0
-        rgba = torch.cat([rgb, alpha.clamp(0, 1)], dim=-1)
-        img = (rgba * 255).clamp(0, 255).byte().numpy()
-        images.append(img)
+    for size in available_sizes:
+        rows = []
 
-    grid = np.zeros((size * 2, size * 2, 4), dtype=np.uint8)
-    for i, img in enumerate(images):
-        r, c = divmod(i, 2)
-        grid[r * size:(r + 1) * size, c * size:(c + 1) * size] = img
+        # --- Row 1: Unconditional ---
+        row_imgs = []
+        for j in range(n_cols):
+            null_pooled = torch.zeros(1, 768, device=device)
+            null_tokens = torch.zeros(1, 77, 768, device=device)
+            pal_t = torch.zeros(1, 1, 3, device=device)
+            pal_m = torch.ones(1, 1, dtype=torch.bool, device=device)
 
-    Image.fromarray(grid, "RGBA").save(f"samples/step_{step:07d}.png")
-    logger.info(f"Saved sample grid: samples/step_{step:07d}.png")
+            cond, cross = cond_assembler(
+                sigma=torch.ones(1, device=device),
+                text_pooled=null_pooled, text_tokens=null_tokens,
+                palette=pal_t, palette_mask=pal_m, resolution=size,
+                drop_text=True, drop_palette=True,
+            )
+            img = _sample_one(precond, cond, cross, size, device, model_cfg,
+                              seed=base_seed + j)
+            row_imgs.append(img)
+        rows.append(np.concatenate(row_imgs, axis=1))
+
+        # --- Row 2: Text-conditioned (CFG) ---
+        row_imgs = []
+        for j in range(n_cols):
+            pooled = eval_embs[f"pooled_{j}"]
+            tokens = eval_embs[f"tokens_{j}"]
+            pal_t = torch.zeros(1, 1, 3, device=device)
+            pal_m = torch.ones(1, 1, dtype=torch.bool, device=device)
+
+            # Conditional
+            cond_c, cross_c = cond_assembler(
+                sigma=torch.ones(1, device=device),
+                text_pooled=pooled, text_tokens=tokens,
+                palette=pal_t, palette_mask=pal_m, resolution=size,
+            )
+            # Unconditional
+            cond_u, cross_u = cond_assembler(
+                sigma=torch.ones(1, device=device),
+                text_pooled=pooled, text_tokens=tokens,
+                palette=pal_t, palette_mask=pal_m, resolution=size,
+                drop_text=True, drop_palette=True,
+            )
+
+            # Manual CFG: generate both and blend
+            sampler = HeunSampler()
+            rng = torch.Generator(device=device).manual_seed(base_seed + n_cols + j)
+            x = torch.randn(1, 4, size, size, generator=rng, device=device)
+            sigmas = sampler.get_sigmas(20, device)
+            x = x * sigmas[0]
+            x_self_cond = None
+
+            for i in range(20):
+                sigma_cur = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                sigma_batch = torch.full((1,), sigma_cur, device=device)
+
+                sc = x_self_cond if model_cfg["self_condition"] else None
+                pred_c = precond(x, sigma_batch, cond_c, cross_c, sc)
+                pred_u = precond(x, sigma_batch, cond_u, cross_u, sc)
+                denoised = pred_u + guidance_scale * (pred_c - pred_u)
+
+                if model_cfg["self_condition"]:
+                    x_self_cond = denoised.detach()
+
+                d = (x - denoised) / sigma_cur
+                x_next = x + d * (sigma_next - sigma_cur)
+
+                if sigma_next > 0:
+                    sigma_batch_next = torch.full((1,), sigma_next, device=device)
+                    sc2 = x_self_cond if model_cfg["self_condition"] else None
+                    pred_c2 = precond(x_next, sigma_batch_next, cond_c, cross_c, sc2)
+                    pred_u2 = precond(x_next, sigma_batch_next, cond_u, cross_u, sc2)
+                    denoised2 = pred_u2 + guidance_scale * (pred_c2 - pred_u2)
+                    d2 = (x_next - denoised2) / sigma_next
+                    x_next = x + (d + d2) / 2 * (sigma_next - sigma_cur)
+
+                x = x_next
+
+            x_out = x.squeeze(0).permute(1, 2, 0).cpu()
+            oklab = denormalize_oklab(x_out[:, :, :3])
+            rgb = oklab_to_srgb_torch(oklab)
+            alpha = (x_out[:, :, 3:4] + 1.0) / 2.0
+            rgba = torch.cat([rgb, alpha.clamp(0, 1)], dim=-1)
+            img = (rgba * 255).clamp(0, 255).byte().numpy()
+            row_imgs.append(img)
+        rows.append(np.concatenate(row_imgs, axis=1))
+
+        # --- Row 3: Palette-conditioned (PICO-8 + CFG) ---
+        row_imgs = []
+        for j in range(n_cols):
+            null_pooled = torch.zeros(1, 768, device=device)
+            null_tokens = torch.zeros(1, 77, 768, device=device)
+
+            # Conditional (palette only, no text)
+            cond_c, cross_c = cond_assembler(
+                sigma=torch.ones(1, device=device),
+                text_pooled=null_pooled, text_tokens=null_tokens,
+                palette=pico8_lab, palette_mask=pico8_mask, resolution=size,
+                drop_text=True,
+            )
+            # Unconditional
+            cond_u, cross_u = cond_assembler(
+                sigma=torch.ones(1, device=device),
+                text_pooled=null_pooled, text_tokens=null_tokens,
+                palette=pico8_lab, palette_mask=pico8_mask, resolution=size,
+                drop_text=True, drop_palette=True,
+            )
+
+            sampler = HeunSampler()
+            rng = torch.Generator(device=device).manual_seed(base_seed + 2 * n_cols + j)
+            x = torch.randn(1, 4, size, size, generator=rng, device=device)
+            sigmas = sampler.get_sigmas(20, device)
+            x = x * sigmas[0]
+            x_self_cond = None
+
+            for i in range(20):
+                sigma_cur = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                sigma_batch = torch.full((1,), sigma_cur, device=device)
+
+                sc = x_self_cond if model_cfg["self_condition"] else None
+                pred_c = precond(x, sigma_batch, cond_c, cross_c, sc)
+                pred_u = precond(x, sigma_batch, cond_u, cross_u, sc)
+                denoised = pred_u + guidance_scale * (pred_c - pred_u)
+
+                if model_cfg["self_condition"]:
+                    x_self_cond = denoised.detach()
+
+                d = (x - denoised) / sigma_cur
+                x_next = x + d * (sigma_next - sigma_cur)
+
+                if sigma_next > 0:
+                    sigma_batch_next = torch.full((1,), sigma_next, device=device)
+                    sc2 = x_self_cond if model_cfg["self_condition"] else None
+                    pred_c2 = precond(x_next, sigma_batch_next, cond_c, cross_c, sc2)
+                    pred_u2 = precond(x_next, sigma_batch_next, cond_u, cross_u, sc2)
+                    denoised2 = pred_u2 + guidance_scale * (pred_c2 - pred_u2)
+                    d2 = (x_next - denoised2) / sigma_next
+                    x_next = x + (d + d2) / 2 * (sigma_next - sigma_cur)
+
+                x = x_next
+
+            x_out = x.squeeze(0).permute(1, 2, 0).cpu()
+            oklab = denormalize_oklab(x_out[:, :, :3])
+            rgb = oklab_to_srgb_torch(oklab)
+            alpha = (x_out[:, :, 3:4] + 1.0) / 2.0
+            rgba = torch.cat([rgb, alpha.clamp(0, 1)], dim=-1)
+            img = (rgba * 255).clamp(0, 255).byte().numpy()
+            row_imgs.append(img)
+        rows.append(np.concatenate(row_imgs, axis=1))
+
+        # Assemble grid: 3 rows x 4 cols
+        grid = np.concatenate(rows, axis=0)
+        out_path = f"samples/step_{step:07d}_{size}px.png"
+        Image.fromarray(grid, "RGBA").save(out_path)
+        logger.info(f"Saved sample grid ({size}px): {out_path}")
 
     ema_model.train()
     cond_assembler.train()

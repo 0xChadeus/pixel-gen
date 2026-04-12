@@ -26,14 +26,15 @@ training:
   gradient_accumulation: 16
   learning_rate: 1.0e-4
   warmup_steps: 2000
-  total_steps: 300000
-  ema_decay: 0.995
+  total_steps: 400000
+  ema_decay: 0.9995
   mixed_precision: fp16
   weight_decay: 0.01
   grad_clip_norm: 1.0
   cond_drop_text: 0.1
   cond_drop_palette: 0.1
   cond_drop_both: 0.05
+  lpips_weight: 0.05
   sample_every: 1000
   log_every: 100
   save_every: 5000

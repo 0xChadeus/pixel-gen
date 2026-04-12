@@ -20,6 +20,32 @@ DATASETS = {
         "image_col": "image",
         "license": "CC-BY-SA 3.0",
     },
+    "pico8_sprites": {
+        "hf_id": "Fraser/pico-8-games",
+        "image_col": "spritesheet",
+        "license": "CC0",
+    },
+    "pixel_art_thliang": {
+        "hf_id": "thliang01/Pixel_Art",
+        "image_col": "image",
+        "license": "CC0",
+    },
+    "diffusiondb_pixel": {
+        "hf_id": "jainr3/diffusiondb-pixelart",
+        "image_col": "image",
+        "license": "CC0",
+    },
+    "opengameart_cc0": {
+        "hf_id": "nyuuzyou/OpenGameArt-CC0",
+        "image_col": "image",
+        "license": "CC0",
+        "subset": "2d-art",
+    },
+    "vatsadev_pixel": {
+        "hf_id": "VatsaDev/pixel-art",
+        "image_col": "image",
+        "license": "CC0",
+    },
 }
 
 
@@ -34,7 +60,16 @@ def download_dataset(name: str, output_dir: str, max_items: int = 0):
     out.mkdir(parents=True, exist_ok=True)
 
     print(f"Downloading {name} ({info['hf_id']})...")
-    ds = load_dataset(info["hf_id"], split="train")
+    subset = info.get("subset")
+    try:
+        ds = load_dataset(info["hf_id"], name=subset, split="train")
+    except Exception:
+        # Some datasets use different split names or configs
+        try:
+            ds = load_dataset(info["hf_id"], split="train")
+        except Exception as e:
+            print(f"Failed to load {name}: {e}")
+            return
 
     count = 0
     for i, item in enumerate(tqdm(ds, desc=name)):

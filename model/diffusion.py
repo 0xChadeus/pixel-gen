@@ -64,18 +64,26 @@ class EDMPrecond(nn.Module):
 
 
 class EDMLoss(nn.Module):
-    """EDM training loss with optimal weighting.
+    """EDM training loss with optimal weighting and optional LPIPS.
 
     Samples noise levels from log-normal distribution and applies
-    the EDM loss weighting lambda(sigma).
+    the EDM loss weighting lambda(sigma). Optionally adds LPIPS
+    perceptual loss as an auxiliary term for improved pixel quality.
     """
 
     def __init__(self, sigma_data: float = 0.5, P_mean: float = -1.2,
-                 P_std: float = 1.2):
+                 P_std: float = 1.2, lpips_weight: float = 0.0):
         super().__init__()
         self.sigma_data = sigma_data
         self.P_mean = P_mean
         self.P_std = P_std
+        self.lpips_weight = lpips_weight
+
+        self._lpips_fn = None
+        if lpips_weight > 0:
+            import lpips
+            self._lpips_fn = lpips.LPIPS(net="alex", verbose=False)
+            self._lpips_fn.requires_grad_(False)
 
     def forward(
         self,
@@ -84,6 +92,7 @@ class EDMLoss(nn.Module):
         cond: torch.Tensor,
         cross_tokens: torch.Tensor,
         x_self_cond: torch.Tensor | None = None,
+        resolution: int = 64,
     ) -> torch.Tensor:
         """Compute weighted EDM loss.
 
@@ -93,14 +102,19 @@ class EDMLoss(nn.Module):
             cond: (B, cond_dim) conditioning
             cross_tokens: (B, T, D) text tokens
             x_self_cond: optional self-conditioning
+            resolution: image resolution for noise schedule adjustment
 
         Returns:
             Scalar loss
         """
         B = x_clean.shape[0]
 
+        # Resolution-aware noise schedule: shift P_mean based on resolution
+        # Higher resolution = more pixel redundancy = shift toward noisier
+        P_mean_adj = self.P_mean + 0.5 * math.log(resolution / 64)
+
         # Sample noise levels from log-normal
-        log_sigma = torch.randn(B, device=x_clean.device) * self.P_std + self.P_mean
+        log_sigma = torch.randn(B, device=x_clean.device) * self.P_std + P_mean_adj
         sigma = log_sigma.exp()
 
         # Loss weighting
@@ -114,8 +128,22 @@ class EDMLoss(nn.Module):
         denoised = precond_model(x_noisy, sigma, cond, cross_tokens, x_self_cond)
 
         # Weighted MSE loss
-        loss = weight.reshape(-1, 1, 1, 1) * (denoised - x_clean) ** 2
-        return loss.mean()
+        mse_loss = weight.reshape(-1, 1, 1, 1) * (denoised - x_clean) ** 2
+        total_loss = mse_loss.mean()
+
+        # LPIPS perceptual loss (only for low-noise samples where it's meaningful)
+        if self._lpips_fn is not None and self.lpips_weight > 0:
+            low_noise = sigma < 1.0
+            if low_noise.any():
+                self._lpips_fn = self._lpips_fn.to(x_clean.device)
+                # Convert OKLab (4ch) to RGB-like (3ch) for LPIPS
+                # Use first 3 channels (OKLab) scaled to roughly [-1, 1]
+                denoised_rgb = denoised[low_noise, :3]
+                clean_rgb = x_clean[low_noise, :3]
+                lpips_val = self._lpips_fn(denoised_rgb, clean_rgb).mean()
+                total_loss = total_loss + self.lpips_weight * lpips_val
+
+        return total_loss
 
 
 class HeunSampler:

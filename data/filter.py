@@ -53,6 +53,42 @@ def is_valid_pixel_art(img: np.ndarray, max_colors: int = 256,
     return True, "ok"
 
 
+def detect_effective_resolution(img: np.ndarray, threshold: float = 0.55) -> int:
+    """Estimate the true pixel resolution of an image that may be upscaled.
+
+    Checks block uniformity at several scales. If most NxN blocks are
+    a single color, the image is effectively (img_size / N) resolution.
+
+    Args:
+        img: (H, W, 4) RGBA uint8
+        threshold: fraction of uniform blocks to consider upscaled
+
+    Returns:
+        Effective resolution (max dimension) of the image.
+    """
+    H, W = img.shape[:2]
+    rgb = img[:, :, :3]
+
+    for block_size in [8, 6, 5, 4, 3, 2]:
+        if H < block_size * 4 or W < block_size * 4:
+            continue  # too few blocks to be meaningful
+
+        uniform = 0
+        total = 0
+        for y in range(0, H - block_size + 1, block_size):
+            for x in range(0, W - block_size + 1, block_size):
+                block = rgb[y:y + block_size, x:x + block_size]
+                total += 1
+                if np.all(block == block[0, 0]):
+                    uniform += 1
+
+        if total > 0 and (uniform / total) > threshold:
+            effective = max(H // block_size, W // block_size)
+            return effective
+
+    return max(H, W)
+
+
 def filter_directory(input_dir: str, output_dir: str, **kwargs):
     """Filter a directory of images, copying valid ones to output."""
     from pathlib import Path
