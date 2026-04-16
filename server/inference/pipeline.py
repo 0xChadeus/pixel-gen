@@ -46,7 +46,6 @@ class InferencePipeline:
             cond_dim=config.cond_dim,
             clip_dim=768,
             cross_attn_dim=config.cross_attn_dim,
-            supported_sizes=config.supported_sizes,
         ).to(self.device)
 
         self.precond = EDMPrecond(self.model, sigma_data=config.sigma_data)
@@ -74,7 +73,6 @@ class InferencePipeline:
     def generate(
         self,
         prompt: str,
-        size: int = 128,
         palette_hex: list[str] | None = None,
         guidance_scale: float = 5.0,
         num_steps: int = 35,
@@ -86,11 +84,10 @@ class InferencePipeline:
         init_strength: float = 0.6,
         progress_callback=None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Generate a pixel art sprite.
+        """Generate a 128x128 pixel art sprite.
 
         Args:
             prompt: Text description
-            size: Output size (32, 64, or 128)
             palette_hex: List of hex color strings, or None for auto
             guidance_scale: CFG scale
             num_steps: Sampling steps
@@ -103,7 +100,7 @@ class InferencePipeline:
             progress_callback: Called with (step, total)
 
         Returns:
-            image: (size, size, 4) RGBA uint8
+            image: (128, 128, 4) RGBA uint8
             palette: (N, 3) RGB uint8 palette used
         """
         if seed >= 0:
@@ -131,7 +128,6 @@ class InferencePipeline:
             text_tokens=text_tokens,
             palette=palette_t,
             palette_mask=palette_mask,
-            resolution=size,
         )
         uncond_cond, uncond_cross = self.cond_assembler(
             sigma=torch.ones(1, device=self.device),
@@ -139,12 +135,11 @@ class InferencePipeline:
             text_tokens=uncond_tokens,
             palette=palette_t,
             palette_mask=palette_mask,
-            resolution=size,
             drop_text=True,
             drop_palette=True,
         )
 
-        shape = (1, 4, size, size)  # B, C, H, W
+        shape = (1, 4, 128, 128)  # B, C, H, W
 
         # Sample with CFG
         def cfg_denoise(x, sigma_batch, x_self_cond=None):

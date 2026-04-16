@@ -1,47 +1,50 @@
-"""Download pixel art datasets from HuggingFace and other sources."""
+"""Download pixel art datasets from HuggingFace and Kaggle."""
 
 import argparse
 import os
 from pathlib import Path
 
-from datasets import load_dataset
 from PIL import Image
 from tqdm import tqdm
 
 
 DATASETS = {
+    "kaggle_pixelart": {
+        "source": "kaggle",
+        "kaggle_id": "ebrahimelgazar/pixel-art",
+        "license": "CC0",
+    },
+    "free_pixelart": {
+        "source": "huggingface",
+        "hf_id": "bghira/free-to-use-pixelart",
+        "image_col": "image",
+        "license": "permissive",
+    },
     "limbicnation": {
+        "source": "huggingface",
         "hf_id": "Limbicnation/pixel-art-character",
         "image_col": "image",
         "license": "CC0",
     },
-    "lpc_4view": {
-        "hf_id": "carlosuperb/lpc-4view-pixel-art-diffusion",
-        "image_col": "image",
-        "license": "CC-BY-SA 3.0",
-    },
-    "pico8_sprites": {
-        "hf_id": "Fraser/pico-8-games",
-        "image_col": "spritesheet",
-        "license": "CC0",
-    },
-    "pixel_art_thliang": {
-        "hf_id": "thliang01/Pixel_Art",
-        "image_col": "image",
+    "kaggle_pixel_chars": {
+        "source": "kaggle",
+        "kaggle_id": "volodymyrpivoshenko/pixel-characters-dataset",
         "license": "CC0",
     },
     "diffusiondb_pixel": {
+        "source": "huggingface",
         "hf_id": "jainr3/diffusiondb-pixelart",
         "image_col": "image",
         "license": "CC0",
     },
-    "opengameart_cc0": {
-        "hf_id": "nyuuzyou/OpenGameArt-CC0",
+    "pixel_art_thliang": {
+        "source": "huggingface",
+        "hf_id": "thliang01/Pixel_Art",
         "image_col": "image",
         "license": "CC0",
-        "subset": "2d-art",
     },
     "vatsadev_pixel": {
+        "source": "huggingface",
         "hf_id": "VatsaDev/pixel-art",
         "image_col": "image",
         "license": "CC0",
@@ -49,11 +52,9 @@ DATASETS = {
 }
 
 
-def download_dataset(name: str, output_dir: str, max_items: int = 0):
-    """Download a single dataset and save images as PNG."""
-    if name not in DATASETS:
-        print(f"Unknown dataset: {name}. Available: {list(DATASETS.keys())}")
-        return
+def download_hf_dataset(name: str, output_dir: str, max_items: int = 0):
+    """Download a HuggingFace dataset and save images as PNG."""
+    from datasets import load_dataset
 
     info = DATASETS[name]
     out = Path(output_dir) / name
@@ -64,7 +65,6 @@ def download_dataset(name: str, output_dir: str, max_items: int = 0):
     try:
         ds = load_dataset(info["hf_id"], name=subset, split="train")
     except Exception:
-        # Some datasets use different split names or configs
         try:
             ds = load_dataset(info["hf_id"], split="train")
         except Exception as e:
@@ -77,10 +77,7 @@ def download_dataset(name: str, output_dir: str, max_items: int = 0):
             break
 
         img = item.get(info["image_col"])
-        if img is None:
-            continue
-
-        if not isinstance(img, Image.Image):
+        if img is None or not isinstance(img, Image.Image):
             continue
 
         img = img.convert("RGBA")
@@ -88,6 +85,47 @@ def download_dataset(name: str, output_dir: str, max_items: int = 0):
         count += 1
 
     print(f"Saved {count} images to {out}")
+
+
+def download_kaggle_dataset(name: str, output_dir: str, max_items: int = 0):
+    """Download a Kaggle dataset via kagglehub and save images as PNG."""
+    import kagglehub
+
+    info = DATASETS[name]
+    out = Path(output_dir) / name
+    out.mkdir(parents=True, exist_ok=True)
+
+    print(f"Downloading {name} ({info['kaggle_id']})...")
+    path = kagglehub.dataset_download(info["kaggle_id"])
+
+    count = 0
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    for img_path in tqdm(sorted(Path(path).rglob("*")), desc=name):
+        if img_path.suffix.lower() not in image_exts:
+            continue
+        if max_items > 0 and count >= max_items:
+            break
+        try:
+            img = Image.open(img_path).convert("RGBA")
+            img.save(out / f"{name}_{count:06d}.png")
+            count += 1
+        except Exception:
+            continue
+
+    print(f"Saved {count} images to {out}")
+
+
+def download_dataset(name: str, output_dir: str, max_items: int = 0):
+    """Download a dataset by name, dispatching to the appropriate backend."""
+    if name not in DATASETS:
+        print(f"Unknown dataset: {name}. Available: {list(DATASETS.keys())}")
+        return
+
+    info = DATASETS[name]
+    if info["source"] == "kaggle":
+        download_kaggle_dataset(name, output_dir, max_items)
+    else:
+        download_hf_dataset(name, output_dir, max_items)
 
 
 def main():

@@ -20,10 +20,6 @@ class EDMUNet(nn.Module):
         Encoder: 128->64->32->16 (with attention at 32 and 16)
         Bottleneck: 16x16 with attention
         Decoder: 16->32->64->128 (with attention at 16 and 32)
-
-    Automatically adapts to smaller inputs (64x64, 32x32) — convolutions
-    are resolution-agnostic, attention activates wherever feature maps
-    match attention_resolutions.
     """
 
     def __init__(

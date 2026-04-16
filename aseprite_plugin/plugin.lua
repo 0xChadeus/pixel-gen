@@ -114,7 +114,6 @@ local function send_generate(opts)
     local request = {
         action = "generate",
         prompt = opts.prompt or "pixel art sprite",
-        size = opts.size or 128,
         guidance_scale = opts.guidance_scale or 5.0,
         steps = opts.steps or 35,
         seed = opts.seed or -1,
@@ -146,8 +145,6 @@ local function show_generate_dialog()
     dlg = Dialog{ title = "Pixel Gen" }
 
     dlg:entry{ id = "prompt", label = "Prompt:", text = "pixel art knight character, side view" }
-    dlg:combobox{ id = "size", label = "Size:", option = "128",
-                  options = { "32", "64", "128" } }
     dlg:combobox{ id = "palette_source", label = "Palette:", option = "Auto (16 colors)",
                   options = PALETTE_PRESETS }
     dlg:slider{ id = "guidance", label = "Guidance:", min = 10, max = 150, value = 50 }
@@ -184,7 +181,6 @@ local function show_generate_dialog()
 
         send_generate({
             prompt = dlg.data.prompt,
-            size = tonumber(dlg.data.size),
             palette_source = palette_source,
             guidance_scale = dlg.data.guidance / 10.0,
             steps = dlg.data.steps,
@@ -197,8 +193,7 @@ local function show_generate_dialog()
 
     dlg:button{ id = "apply_btn", text = "Apply to Sprite", onclick = function()
         if current_result and current_palette then
-            local size = tonumber(dlg.data.size)
-            sprite_utils.apply_pixels(current_result, size, size, current_palette)
+            sprite_utils.apply_pixels(current_result, 128, 128, current_palette)
         else
             app.alert("No generated image to apply. Generate first!")
         end

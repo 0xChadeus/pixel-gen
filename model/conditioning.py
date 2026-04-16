@@ -1,4 +1,4 @@
-"""Conditioning modules: CLIP text, palette transformer, timestep, resolution."""
+"""Conditioning modules: CLIP text, palette transformer, timestep."""
 
 import math
 import torch
@@ -92,20 +92,6 @@ class PaletteConditioner(nn.Module):
         return self.out_proj(x)
 
 
-class ResolutionConditioner(nn.Module):
-    """Learnable embedding per supported resolution."""
-
-    def __init__(self, supported_sizes: list[int], cond_dim: int):
-        super().__init__()
-        self.size_to_idx = {s: i for i, s in enumerate(supported_sizes)}
-        self.embed = nn.Embedding(len(supported_sizes), cond_dim)
-
-    def forward(self, size: int, batch_size: int, device: torch.device) -> torch.Tensor:
-        idx = self.size_to_idx[size]
-        idx_t = torch.full((batch_size,), idx, dtype=torch.long, device=device)
-        return self.embed(idx_t)
-
-
 class CLIPTextProjector(nn.Module):
     """Project CLIP pooled text embedding to conditioning space.
 
@@ -153,19 +139,15 @@ class ConditioningAssembler(nn.Module):
     """Assembles all conditioning signals into a single FiLM vector + cross-attn tokens."""
 
     def __init__(self, cond_dim: int = 512, clip_dim: int = 768,
-                 cross_attn_dim: int = 512, supported_sizes: list[int] | None = None):
+                 cross_attn_dim: int = 512):
         super().__init__()
-        if supported_sizes is None:
-            supported_sizes = [32, 64, 128]
-
         self.timestep_cond = TimestepConditioner(cond_dim)
         self.text_proj = CLIPTextProjector(clip_dim, cond_dim, cross_attn_dim)
         self.palette_cond = PaletteConditioner(cond_dim=cond_dim)
-        self.resolution_cond = ResolutionConditioner(supported_sizes, cond_dim)
 
-        # Merge: timestep + text_global + palette + resolution -> final cond
+        # Merge: timestep + text_global + palette -> final cond
         self.merge = nn.Sequential(
-            nn.Linear(cond_dim * 4, cond_dim * 2),
+            nn.Linear(cond_dim * 3, cond_dim * 2),
             nn.SiLU(),
             nn.Linear(cond_dim * 2, cond_dim),
         )
@@ -177,7 +159,6 @@ class ConditioningAssembler(nn.Module):
         text_tokens: torch.Tensor,
         palette: torch.Tensor,
         palette_mask: torch.Tensor | None,
-        resolution: int,
         drop_text: bool = False,
         drop_palette: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -186,15 +167,11 @@ class ConditioningAssembler(nn.Module):
             cond: (B, cond_dim) FiLM conditioning vector
             cross_tokens: (B, 77, cross_attn_dim) for cross-attention
         """
-        B = sigma.shape[0]
-        device = sigma.device
-
         t_cond = self.timestep_cond(sigma)
         text_global, cross_tokens = self.text_proj(text_pooled, text_tokens, force_null=drop_text)
         pal_cond = self.palette_cond(palette, palette_mask, force_null=drop_palette)
-        res_cond = self.resolution_cond(resolution, B, device)
 
-        combined = torch.cat([t_cond, text_global, pal_cond, res_cond], dim=-1)
+        combined = torch.cat([t_cond, text_global, pal_cond], dim=-1)
         cond = self.merge(combined)
 
         return cond, cross_tokens

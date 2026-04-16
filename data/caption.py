@@ -116,13 +116,12 @@ def _clean_vlm_output(text: str) -> str:
     return text
 
 
-def assemble_caption(attributes: dict, subject: str, target_size: int) -> str:
+def assemble_caption(attributes: dict, subject: str) -> str:
     """Assemble a structured caption from attributes and subject description.
 
     Args:
         attributes: Dict from detect_all_attributes()
         subject: Cleaned VLM subject description (or empty string)
-        target_size: Image resolution (32, 64, 128)
 
     Returns:
         Structured caption string
@@ -130,7 +129,7 @@ def assemble_caption(attributes: dict, subject: str, target_size: int) -> str:
     parts = []
 
     # Resolution + medium
-    parts.append(f"{target_size}x{target_size} pixel art")
+    parts.append("128x128 pixel art")
 
     # Color count
     color_count = attributes.get("color_count")
@@ -192,66 +191,57 @@ def main():
                         help="Skip Florence-2, use sprite type as subject fallback")
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
+    data_dir = Path(args.data_dir) / "128"
 
-    for size_dir in sorted(data_dir.iterdir()):
-        if not size_dir.is_dir():
+    image_paths = sorted(data_dir.glob("*.png"))
+    if not image_paths:
+        print("No images found in data_dir/128/")
+        return
+
+    print(f"\nCaptioning {len(image_paths)} images at 128x128...")
+
+    # Get VLM subject descriptions
+    if not args.skip_vlm:
+        descriptions = describe_with_florence(
+            image_paths, args.device, args.batch_size,
+        )
+    else:
+        descriptions = {}
+
+    # Assemble captions from attributes + VLM
+    for p in tqdm(image_paths, desc="Assembling captions"):
+        meta_path = p.with_suffix(".json")
+        if not meta_path.exists():
             continue
-        try:
-            size = int(size_dir.name)
-        except ValueError:
-            continue
 
-        image_paths = sorted(size_dir.glob("*.png"))
-        if not image_paths:
-            continue
+        with open(meta_path) as f:
+            meta = json.load(f)
 
-        print(f"\nCaptioning {len(image_paths)} images at {size}x{size}...")
+        attributes = meta.get("attributes", {})
 
-        # Get VLM subject descriptions
-        if not args.skip_vlm:
-            descriptions = describe_with_florence(
-                image_paths, args.device, args.batch_size,
-            )
-        else:
-            descriptions = {}
+        # Subject: VLM output, or fallback to sprite type
+        subject = descriptions.get(p.name, "")
+        if not subject:
+            st = attributes.get("sprite_type", "sprite")
+            if st == "tile":
+                subject = ""
+            elif st in ("object", "effect"):
+                subject = f"an {st}"
+            else:
+                subject = f"a {st}"
 
-        # Assemble captions from attributes + VLM
-        for p in tqdm(image_paths, desc=f"Assembling {size}x{size}"):
-            meta_path = p.with_suffix(".json")
-            if not meta_path.exists():
-                continue
+        caption = assemble_caption(attributes, subject)
+        caption_short = assemble_caption_short(subject)
 
-            with open(meta_path) as f:
-                meta = json.load(f)
+        meta["caption"] = caption
+        meta["caption_short"] = caption_short
+        if p.name in descriptions:
+            meta["vlm_raw"] = descriptions[p.name]
 
-            attributes = meta.get("attributes", {})
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
 
-            # Subject: VLM output, or fallback to sprite type
-            subject = descriptions.get(p.name, "")
-            if not subject:
-                st = attributes.get("sprite_type", "sprite")
-                if st == "tile":
-                    subject = ""
-                elif st in ("object", "effect"):
-                    subject = f"an {st}"
-                else:
-                    subject = f"a {st}"
-
-            caption = assemble_caption(attributes, subject, size)
-            caption_short = assemble_caption_short(subject)
-
-            meta["caption"] = caption
-            meta["caption_short"] = caption_short
-            if p.name in descriptions:
-                meta["vlm_raw"] = descriptions[p.name]
-
-            with open(meta_path, "w") as f:
-                json.dump(meta, f)
-
-        print(f"  Done: {len(image_paths)} captions written")
-
-    print("\nCaptioning complete.")
+    print(f"Done: {len(image_paths)} captions written")
 
 
 if __name__ == "__main__":

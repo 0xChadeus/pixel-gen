@@ -73,7 +73,6 @@ class GenerationHandler:
             return
 
         prompt = req.get("prompt", "pixel art sprite")
-        size = req.get("size", 128)
         palette = req.get("palette")
         guidance_scale = req.get("guidance_scale", self.config.default_guidance_scale)
         steps = req.get("steps", self.config.default_num_steps)
@@ -81,13 +80,6 @@ class GenerationHandler:
         dither_mode = req.get("dither_mode")
         outline_cleanup = req.get("outline_cleanup", True)
         num_colors = req.get("num_colors", 16)
-
-        if size not in self.config.supported_sizes:
-            await websocket.send(json.dumps({
-                "type": "error",
-                "message": f"Unsupported size: {size}. Use {self.config.supported_sizes}",
-            }))
-            return
 
         async def progress_callback(step, total):
             if self._cancel:
@@ -111,7 +103,6 @@ class GenerationHandler:
                 None,
                 lambda: self.pipeline.generate(
                     prompt=prompt,
-                    size=size,
                     palette_hex=palette,
                     guidance_scale=guidance_scale,
                     num_steps=steps,

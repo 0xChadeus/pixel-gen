@@ -1,6 +1,6 @@
 """Evaluation metrics for pixel art diffusion model.
 
-Computes FID per resolution, alpha purity, and palette divergence.
+Computes FID, alpha purity, and palette divergence at 128x128.
 
 Usage:
     python -m training.evaluate --checkpoint checkpoints/step_0050000.pt \
@@ -135,7 +135,6 @@ def generate_samples(
         cond_dim=model_cfg["cond_dim"],
         clip_dim=768,
         cross_attn_dim=model_cfg["cross_attn_dim"],
-        supported_sizes=train_cfg["image_sizes"],
     ).to(device)
 
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -160,7 +159,7 @@ def generate_samples(
         cond, cross = cond_assembler(
             sigma=torch.ones(B, device=device),
             text_pooled=null_pooled, text_tokens=null_tokens,
-            palette=pal_t, palette_mask=pal_m, resolution=size,
+            palette=pal_t, palette_mask=pal_m,
             drop_text=True, drop_palette=True,
         )
 
@@ -211,57 +210,52 @@ def evaluate_checkpoint(
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    sizes = cfg["training"]["image_sizes"]
     step = int(Path(checkpoint_path).stem.split("_")[-1])
+    ref_dir = Path(data_dir) / "128"
 
     results = {"step": step}
 
-    for size in sizes:
-        ref_dir = Path(data_dir) / str(size)
-        if not ref_dir.exists() or len(list(ref_dir.glob("*.png"))) == 0:
-            logger.info(f"Skipping {size}px — no reference data")
-            continue
+    if not ref_dir.exists() or len(list(ref_dir.glob("*.png"))) == 0:
+        logger.info("No reference data in data/processed/128/")
+        return results
 
-        logger.info(f"Evaluating at {size}x{size}...")
+    logger.info("Evaluating at 128x128...")
 
-        # Generate samples
-        images = generate_samples(
-            checkpoint_path, config_path,
-            num_samples=min(num_samples, 512),  # reduce for larger sizes
-            size=size, batch_size=4,
-        )
+    images = generate_samples(
+        checkpoint_path, config_path,
+        num_samples=min(num_samples, 512),
+        size=128, batch_size=4,
+    )
 
-        # Alpha purity
-        alpha_purity = compute_alpha_purity(images)
-        results[f"alpha_purity_{size}"] = f"{alpha_purity:.4f}"
-        logger.info(f"  Alpha purity: {alpha_purity:.4f}")
+    # Alpha purity
+    alpha_purity = compute_alpha_purity(images)
+    results["alpha_purity"] = f"{alpha_purity:.4f}"
+    logger.info(f"  Alpha purity: {alpha_purity:.4f}")
 
-        # Palette divergence
-        kl = compute_palette_divergence(images, ref_dir)
-        results[f"palette_kl_{size}"] = f"{kl:.4f}"
-        logger.info(f"  Palette KL: {kl:.4f}")
+    # Palette divergence
+    kl = compute_palette_divergence(images, ref_dir)
+    results["palette_kl"] = f"{kl:.4f}"
+    logger.info(f"  Palette KL: {kl:.4f}")
 
-        # FID — save generated images to temp dir, compute against reference
-        gen_dir = Path(f"samples/eval_fid_{size}")
-        gen_dir.mkdir(parents=True, exist_ok=True)
+    # FID — save generated images to temp dir, compute against reference
+    gen_dir = Path("samples/eval_fid")
+    gen_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save as RGB (FID expects RGB)
-        for i, img in enumerate(images):
-            rgb = img[:, :, :3]
-            Image.fromarray(rgb, "RGB").save(gen_dir / f"{i:05d}.png")
+    for i, img in enumerate(images):
+        rgb = img[:, :, :3]
+        Image.fromarray(rgb, "RGB").save(gen_dir / f"{i:05d}.png")
 
-        try:
-            fid = compute_fid(str(gen_dir), str(ref_dir))
-            results[f"fid_{size}"] = f"{fid:.2f}"
-            logger.info(f"  FID: {fid:.2f}")
-        except Exception as e:
-            logger.warning(f"  FID computation failed: {e}")
-            results[f"fid_{size}"] = "error"
+    try:
+        fid = compute_fid(str(gen_dir), str(ref_dir))
+        results["fid"] = f"{fid:.2f}"
+        logger.info(f"  FID: {fid:.2f}")
+    except Exception as e:
+        logger.warning(f"  FID computation failed: {e}")
+        results["fid"] = "error"
 
-        # Cleanup temp dir
-        for f in gen_dir.glob("*.png"):
-            f.unlink()
-        gen_dir.rmdir()
+    for f in gen_dir.glob("*.png"):
+        f.unlink()
+    gen_dir.rmdir()
 
     # Append to CSV
     csv_path = Path(output_csv)

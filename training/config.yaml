@@ -7,7 +7,7 @@ model:
   num_heads: 8
   cond_dim: 512
   cross_attn_dim: 512
-  dropout: 0.2
+  dropout: 0.15
   in_channels: 4
   self_condition: true
   color_space: oklab
@@ -16,28 +16,26 @@ model:
 diffusion:
   sigma_min: 0.002
   sigma_max: 80.0
-  P_mean: -1.2
+  P_mean: -0.853
   P_std: 1.2
 
 training:
-  image_sizes: [32, 64, 128]
-  resolution_weights: [0.15, 0.25, 0.60]
   batch_size: 4
   gradient_accumulation: 16
+  max_vram_gb: 18.0
   learning_rate: 1.0e-4
   warmup_steps: 2000
-  total_steps: 400000
-  ema_decay: 0.9995
+  total_steps: 500000
+  ema_decay: 0.9999
   mixed_precision: fp16
   weight_decay: 0.01
   grad_clip_norm: 1.0
   cond_drop_text: 0.1
   cond_drop_palette: 0.1
-  cond_drop_both: 0.05
-  lpips_weight: 0.05
-  sample_every: 1000
+  cond_drop_both: 0.10
+  sample_every: 2000
   log_every: 100
-  save_every: 5000
+  save_every: 10000
   keep_checkpoints: 5
 
 data:

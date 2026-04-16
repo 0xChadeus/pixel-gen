@@ -1,6 +1,6 @@
 """Server configuration."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -27,4 +27,3 @@ class ServerConfig:
     # Sampler defaults
     default_num_steps: int = 35
     default_guidance_scale: float = 5.0
-    supported_sizes: list[int] = field(default_factory=lambda: [32, 64, 128])
