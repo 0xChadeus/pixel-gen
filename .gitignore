@@ -5,9 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-checkpoints/*.pt
-checkpoints/*.safetensors
+checkpoints/
 data/raw/
+data/raw_filtered/
 data/processed/
+samples/
 *.aseprite-extension
 .DS_Store
+data/style_scores.csv
