@@ -13,3 +13,4 @@ samples/
 *.aseprite-extension
 .DS_Store
 data/style_scores.csv
+example_sprites/
