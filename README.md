@@ -38,48 +38,6 @@ Raw model output goes through a cleanup pipeline that enforces pixel art constra
   No rotation, scaling, or shearing
 - Gradient checkpointing supported
 
-## Project Structure
-
-```
-pixel_gen/
-  model/
-    unet.py           # EDM UNet (~134M params)
-    diffusion.py      # EDM preconditioning, loss, Heun sampler, CFG wrapper
-    blocks.py         # ResBlock, FiLM, self/cross-attention, up/downsample
-    conditioning.py   # Timestep, palette, resolution, CLIP text conditioning
-  training/
-    augment.py        # Pixel-art-safe augmentations
-  server/
-    main.py           # Entry point (WebSocket server)
-    config.py         # ServerConfig dataclass
-    ws_handler.py     # WebSocket handler (JSON protocol)
-    inference/
-      pipeline.py     # Text prompt -> pixel art image
-      clip_encoder.py # Frozen CLIP text encoder
-    postprocess/
-      pipeline.py     # Post-processing orchestrator
-      quantize.py     # K-means palette extraction + nearest-color quantization
-      aa_removal.py   # Anti-aliasing artifact removal
-      outline.py      # Outline gap filling + contour detection
-      dither.py       # Ordered and Floyd-Steinberg dithering
-      grid_snap.py    # Grid detection + downsampling for upscaled inputs
-    utils/
-      color.py        # OKLab <-> sRGB (numpy + torch)
-      image_io.py     # RGBA serialization, PNG encoding, hex parsing
-  data/
-    lospec_scraper.py # Download palettes from Lospec as GIMP .gpl files
-  aseprite_plugin/
-    plugin.lua        # Aseprite extension: generate dialog, WebSocket client
-    sprite_utils.lua  # Apply generated pixels + read active palette
-    json.lua          # Minimal JSON encoder/decoder for Lua
-    package.json      # Extension manifest
-  scripts/
-    build_extension.sh  # Package plugin as .aseprite-extension
-    install_plugin.sh   # Symlink plugin into Aseprite's extensions dir
-  checkpoints/        # Model weights (gitignored)
-  samples/            # Training sample snapshots
-```
-
 ## Setup
 
 ```bash
